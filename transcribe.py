@@ -34,7 +34,7 @@ MAX_API_ATTEMPTS = 4
 RETRY_DELAYS_SECONDS = [5, 15, 30, 60]
 
 # Hard network deadlines: no Gemini request can hang forever.
-VOCAB_TIMEOUT_SECONDS = 120
+VOCAB_TIMEOUT_SECONDS = 45
 STT_TIMEOUT_SECONDS = 240
 INLINE_AUDIO_LIMIT_BYTES = 18 * 1024 * 1024  # stay safely under the 20 MB request limit
 
@@ -210,6 +210,16 @@ def call_with_retry(label: str, fn):
     ) from last
 
 
+def call_once(label: str, fn):
+    """Single best-effort API call for optional enhancement stages."""
+    try:
+        return fn()
+    except Exception as exc:
+        raise RuntimeError(
+            f"{label} failed: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
 def upload_file(client, path: Path):
     """Fallback for unexpectedly large audio. Normal chunks are sent inline."""
     return call_with_retry(
@@ -370,7 +380,7 @@ Rules:
             timeout=VOCAB_TIMEOUT_SECONDS,
         )
 
-    interaction = call_with_retry(
+    interaction = call_once(
         f"Vocabulary discovery chunk {chunk_index:03d}",
         _request
     )
@@ -522,8 +532,8 @@ def transcribe_primary_chunk(
         # Vocabulary discovery is an enhancement, not a reason to lose the
         # actual transcription. Continue with terms learned from earlier chunks.
         print(
-            "    WARNING: vocabulary discovery failed/timed out; "
-            "continuing with existing vocabulary."
+            "    WARNING: vocabulary discovery failed/timed out once; "
+            "skipping it and continuing directly to transcription."
         )
         print(f"    Details: {exc}")
         chunk_vocabulary = []
