@@ -750,10 +750,20 @@ def main() -> int:
     api_key = load_key()
     try:
         from google import genai
+        from google.genai import types
     except ImportError:
         print("\nERROR: google-genai is not installed. Run RUN_TRANSCRIBER.bat again.")
         return 4
-    client = genai.Client(api_key=api_key)
+
+    # IMPORTANT: the Interactions SDK has its own hidden retry policy by default.
+    # Disable it so our explicit timeouts/fallbacks regain control immediately.
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(
+            timeout=150_000,  # HttpOptions timeout is milliseconds.
+            retry_options=types.HttpRetryOptions(attempts=0),
+        ),
+    )
 
     duration = state.get("duration_seconds") or get_duration_seconds(source)
     state["duration_seconds"] = duration
@@ -776,7 +786,7 @@ def main() -> int:
         ][:MAX_VOCAB_TERMS]
 
     print(f"\nPrimary chunks: {len(chunks)} (~8 min each, 4 s overlap)")
-    print("Vocabulary: learned from transcript text; STT uses Files API with 4-minute fallback on stalls.")
+    print("Vocabulary: learned from transcript text; hidden SDK retries disabled; 4-minute fallback on stalls.")
     print("Low-WPM QC: checked once on original chunks only (<35 WPM).")
     print("A flagged original chunk is split once into ~4-minute halves.\n")
 
