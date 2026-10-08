@@ -427,7 +427,7 @@ def transcribe_audio(client, audio_path: Path, vocabulary: list[str], mode: str 
             timeout=STT_TIMEOUT_SECONDS,
         )
 
-    interaction = call_with_retry(f"Transcribe {audio_path.name}", _request)
+    interaction = call_once(f"Transcribe {audio_path.name}", _request)
     return (interaction.output_text or "").strip()
 
 def word_count(text: str) -> int:
