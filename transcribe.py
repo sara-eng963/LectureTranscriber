@@ -198,7 +198,10 @@ def call_with_retry(label: str, fn):
             if not retryable_error(exc) or attempt == MAX_API_ATTEMPTS - 1:
                 break
             delay = RETRY_DELAYS_SECONDS[min(attempt, len(RETRY_DELAYS_SECONDS) - 1)]
-            print(f"{label}: temporary API/network error. Retrying in {delay}s...")
+            print(
+                f"{label}: temporary API/network error "
+                f"({type(exc).__name__}: {exc}). Retrying in {delay}s..."
+            )
             time.sleep(delay)
     raise RuntimeError(
         f"{label} failed after retries.\n"
