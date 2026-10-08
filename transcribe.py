@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import getpass
 import json
 import os
@@ -29,8 +30,13 @@ MAX_VOCAB_TERMS = 100
 AUDIO_BITRATE = "48k"
 AUDIO_SAMPLE_RATE = "16000"
 
-MAX_API_ATTEMPTS = 6
-RETRY_DELAYS_SECONDS = [5, 10, 20, 40, 60, 90]
+MAX_API_ATTEMPTS = 4
+RETRY_DELAYS_SECONDS = [5, 15, 30, 60]
+
+# Hard network deadlines: no Gemini request can hang forever.
+VOCAB_TIMEOUT_SECONDS = 120
+STT_TIMEOUT_SECONDS = 240
+INLINE_AUDIO_LIMIT_BYTES = 18 * 1024 * 1024  # stay safely under the 20 MB request limit
 
 SUPPORTED_EXTENSIONS = {
     ".mp4", ".m4a", ".mp3", ".wav", ".mov", ".mkv",
@@ -202,10 +208,40 @@ def call_with_retry(label: str, fn):
 
 
 def upload_file(client, path: Path):
+    """Fallback for unexpectedly large audio. Normal chunks are sent inline."""
     return call_with_retry(
         f"Upload {path.name}",
         lambda: client.files.upload(file=str(path)),
     )
+
+
+def audio_input(client, path: Path) -> dict[str, str]:
+    """
+    Build Gemini audio input.
+
+    Our 48 kbps 8-minute MP3 chunks are only a few MB, so they are sent
+    inline. This avoids a separate Files API upload and the stalls we saw
+    there. Files API is retained only as a safety fallback for >18 MB.
+    """
+    size = path.stat().st_size
+    if size <= INLINE_AUDIO_LIMIT_BYTES:
+        data = base64.b64encode(path.read_bytes()).decode("ascii")
+        return {
+            "type": "audio",
+            "data": data,
+            "mime_type": "audio/mp3",
+        }
+
+    print(
+        f"    {path.name} is {size / (1024**2):.1f} MB; "
+        "using Files API fallback."
+    )
+    uploaded = upload_file(client, path)
+    return {
+        "type": "audio",
+        "uri": uploaded.uri,
+        "mime_type": uploaded.mime_type,
+    }
 
 
 def normalize_vocab_line(line: str) -> str:
@@ -303,8 +339,6 @@ def discover_chunk_vocabulary(
         if saved:
             return saved
 
-    uploaded = upload_file(client, audio_path)
-
     prompt = """Listen to ONLY this short university lecture chunk.
 
 The lecturer primarily speaks Egyptian Arabic and frequently code-switches into English technical terminology.
@@ -321,17 +355,16 @@ Rules:
 - No bullets, numbering, headings, explanations, or commentary.
 """
 
+    audio = audio_input(client, audio_path)
+
     def _request():
         return client.interactions.create(
             model=VOCAB_MODEL,
             input=[
                 {"type": "text", "text": prompt},
-                {
-                    "type": "audio",
-                    "uri": uploaded.uri,
-                    "mime_type": uploaded.mime_type,
-                },
+                audio,
             ],
+            timeout=VOCAB_TIMEOUT_SECONDS,
         )
 
     interaction = call_with_retry(
@@ -349,7 +382,7 @@ Rules:
     return terms
 
 def transcribe_audio(client, audio_path: Path, vocabulary: list[str], mode: str = "verbatim") -> str:
-    uploaded = upload_file(client, audio_path)
+    audio = audio_input(client, audio_path)
 
     tcfg: dict[str, Any] = {"language_codes": LANGUAGE_CODES}
     if vocabulary:
@@ -359,12 +392,9 @@ def transcribe_audio(client, audio_path: Path, vocabulary: list[str], mode: str 
     def _request():
         return client.interactions.create(
             model=STT_MODEL,
-            input=[{
-                "type": "audio",
-                "uri": uploaded.uri,
-                "mime_type": uploaded.mime_type,
-            }],
+            input=[audio],
             generation_config={"transcription_config": tcfg},
+            timeout=STT_TIMEOUT_SECONDS,
         )
 
     interaction = call_with_retry(f"Transcribe {audio_path.name}", _request)
@@ -481,9 +511,20 @@ def transcribe_primary_chunk(
     extract_audio(source, start, duration, audio_path)
 
     print("    Discovering vocabulary for this chunk...")
-    chunk_vocabulary = discover_chunk_vocabulary(
-        client, audio_path, idx, out_dir
-    )
+    try:
+        chunk_vocabulary = discover_chunk_vocabulary(
+            client, audio_path, idx, out_dir
+        )
+    except Exception as exc:
+        # Vocabulary discovery is an enhancement, not a reason to lose the
+        # actual transcription. Continue with terms learned from earlier chunks.
+        print(
+            "    WARNING: vocabulary discovery failed/timed out; "
+            "continuing with existing vocabulary."
+        )
+        print(f"    Details: {exc}")
+        chunk_vocabulary = []
+
     if chunk_vocabulary:
         print(
             "    Terms: "
@@ -653,7 +694,7 @@ def main() -> int:
         ][:MAX_VOCAB_TERMS]
 
     print(f"\nPrimary chunks: {len(chunks)} (~8 min each, 4 s overlap)")
-    print("Vocabulary: discovered per chunk; no full-lecture preprocessing.")
+    print("Vocabulary: per chunk, inline audio, hard timeout, non-blocking fallback.")
     print("Low-WPM QC: checked once on original chunks only (<35 WPM).")
     print("A flagged original chunk is split once into ~4-minute halves.\n")
 
