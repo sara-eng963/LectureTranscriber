@@ -44,6 +44,12 @@ if not exist ".venv\Scripts\python.exe" (
     echo.
 )
 
+echo Checking Python dependencies...
+".venv\Scripts\python.exe" -m pip install --quiet --upgrade -r requirements.txt
+if errorlevel 1 goto :install_failed
+echo Dependencies ready.
+echo.
+
 ".venv\Scripts\python.exe" transcribe.py %*
 set CODE=%errorlevel%
 
