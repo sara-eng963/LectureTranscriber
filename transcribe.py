@@ -34,7 +34,7 @@ MAX_API_ATTEMPTS = 4
 RETRY_DELAYS_SECONDS = [5, 15, 30, 60]
 
 # Hard network deadlines: no Gemini request can hang forever.
-STT_TIMEOUT_SECONDS = 240
+STT_TIMEOUT_SECONDS = 150
 INLINE_AUDIO_LIMIT_BYTES = 18 * 1024 * 1024  # stay safely under the 20 MB request limit
 
 SUPPORTED_EXTENSIONS = {
@@ -397,8 +397,18 @@ TRANSCRIPT:
     )
     return terms
 
+
 def transcribe_audio(client, audio_path: Path, vocabulary: list[str], mode: str = "verbatim") -> str:
-    audio = audio_input(client, audio_path)
+    """
+    Transcribe one audio chunk.
+
+    Gemini's official transcription examples use the Files API for audio.
+    Upload once, then pass the returned URI to gemini-3.5-transcribe.
+    """
+    size_mb = audio_path.stat().st_size / (1024 ** 2)
+    print(f"    Uploading {audio_path.name} ({size_mb:.1f} MB) for STT...")
+    uploaded = upload_file(client, audio_path)
+    print("    Audio uploaded; waiting for Gemini transcription...")
 
     tcfg: dict[str, Any] = {"language_codes": LANGUAGE_CODES}
     if vocabulary:
@@ -408,14 +418,17 @@ def transcribe_audio(client, audio_path: Path, vocabulary: list[str], mode: str 
     def _request():
         return client.interactions.create(
             model=STT_MODEL,
-            input=[audio],
+            input=[{
+                "type": "audio",
+                "uri": uploaded.uri,
+                "mime_type": uploaded.mime_type,
+            }],
             generation_config={"transcription_config": tcfg},
             timeout=STT_TIMEOUT_SECONDS,
         )
 
     interaction = call_with_retry(f"Transcribe {audio_path.name}", _request)
     return (interaction.output_text or "").strip()
-
 
 def word_count(text: str) -> int:
     return len(re.findall(r"\S+", text))
@@ -534,7 +547,65 @@ def transcribe_primary_chunk(
     else:
         print("    No accumulated vocabulary yet; transcribing directly.")
 
-    text = transcribe_audio(client, audio_path, vocabulary, mode="verbatim")
+    try:
+        text = transcribe_audio(client, audio_path, vocabulary, mode="verbatim")
+    except Exception as exc:
+        print(f"    Primary 8-minute STT failed/stalled: {exc}")
+        print("    Falling back immediately to two ~4-minute transcription calls.")
+
+        midpoint = start + duration / 2.0
+        h1_start = start
+        h1_end = min(end, midpoint + HALF_OVERLAP_SECONDS / 2.0)
+        h2_start = max(start, midpoint - HALF_OVERLAP_SECONDS / 2.0)
+        h2_end = end
+
+        half1 = transcribe_half_once(
+            client, source, vocabulary, work_dir, idx, "A",
+            h1_start, h1_end
+        )
+        half2 = transcribe_half_once(
+            client, source, vocabulary, work_dir, idx, "B",
+            h2_start, h2_end
+        )
+
+        combined_text = (
+            f"[{fmt_time(half1['start'])}–{fmt_time(half1['end'])} | {half1['mode']}]\n"
+            f"{half1['text'].strip()}\n\n"
+            f"[{fmt_time(half2['start'])}–{fmt_time(half2['end'])} | {half2['mode']}]\n"
+            f"{half2['text'].strip()}"
+        ).strip()
+
+        chunk_vocabulary = discover_terms_from_transcript(
+            client, combined_text, idx, out_dir
+        )
+        vocabulary = merge_vocab(
+            global_vocabulary,
+            chunk_vocabulary,
+            MAX_VOCAB_TERMS
+        )
+        save_global_vocabulary(out_dir, vocabulary)
+
+        combined_metrics = qc_metrics(combined_text, duration)
+        status = (
+            "OK"
+            if half1["status"] == "OK" and half2["status"] == "OK"
+            else "NEEDS_REVIEW"
+        )
+
+        return ({
+            "index": idx,
+            "start": start,
+            "end": end,
+            "duration": duration,
+            "mode": "split-after-stt-failure",
+            "text": combined_text,
+            "metrics": combined_metrics,
+            "reasons": ["primary-stt-failure"],
+            "status": status,
+            "split": True,
+            "halves": [half1, half2],
+            "chunk_vocabulary": chunk_vocabulary,
+        }, vocabulary)
 
     # Learn terminology from the TEXT result for subsequent chunks.
     chunk_vocabulary = discover_terms_from_transcript(
@@ -705,7 +776,7 @@ def main() -> int:
         ][:MAX_VOCAB_TERMS]
 
     print(f"\nPrimary chunks: {len(chunks)} (~8 min each, 4 s overlap)")
-    print("Vocabulary: learned from completed transcript text; audio is transcribed only once.")
+    print("Vocabulary: learned from transcript text; STT uses Files API with 4-minute fallback on stalls.")
     print("Low-WPM QC: checked once on original chunks only (<35 WPM).")
     print("A flagged original chunk is split once into ~4-minute halves.\n")
 
