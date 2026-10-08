@@ -34,7 +34,6 @@ MAX_API_ATTEMPTS = 4
 RETRY_DELAYS_SECONDS = [5, 15, 30, 60]
 
 # Hard network deadlines: no Gemini request can hang forever.
-VOCAB_TIMEOUT_SECONDS = 45
 STT_TIMEOUT_SECONDS = 240
 INLINE_AUDIO_LIMIT_BYTES = 18 * 1024 * 1024  # stay safely under the 20 MB request limit
 
@@ -328,20 +327,21 @@ def save_global_vocabulary(out_dir: Path, terms: list[str]) -> None:
     )
 
 
-def discover_chunk_vocabulary(
+
+def discover_terms_from_transcript(
     client,
-    audio_path: Path,
+    transcript_text: str,
     chunk_index: int,
     out_dir: Path,
 ) -> list[str]:
     """
-    Fast vocabulary discovery for ONE ~8-minute chunk.
+    Fast TEXT-only vocabulary discovery after transcription.
 
-    This replaces the old design that made Gemini inspect the entire
-    60–90 minute lecture before transcription could even begin.
+    This avoids sending the same audio to two different models. Any technical
+    terms recovered from chunk N are carried forward as custom vocabulary for
+    chunk N+1.
     """
     chunk_vocab_file = out_dir / f"vocab_chunk_{chunk_index:03d}.txt"
-    raw_file = out_dir / f"vocab_chunk_{chunk_index:03d}_raw.txt"
 
     if chunk_vocab_file.exists():
         saved = [
@@ -352,42 +352,45 @@ def discover_chunk_vocabulary(
         if saved:
             return saved
 
-    prompt = """Listen to ONLY this short university lecture chunk.
+    if not transcript_text.strip():
+        return []
 
-The lecturer primarily speaks Egyptian Arabic and frequently code-switches into English technical terminology.
+    prompt = """Extract technical English terms, acronyms, model names, dataset names,
+software/library names, researcher/proper names, and specialized English phrases
+that actually appear in the transcript below.
 
-Identify English technical terms, acronyms, model names, dataset names, software/library names, researcher/proper names, and specialized English phrases that are ACTUALLY SPOKEN or clearly audible in THIS CHUNK.
+The transcript is from an Egyptian Arabic university lecture with English
+code-switching.
 
 Rules:
 - Do not summarize.
-- Do not infer vocabulary merely because it belongs to the subject.
-- Preserve likely standard English spelling/capitalization.
-- Prefer specific technical terms over ordinary English.
-- Maximum 40 terms for this chunk.
-- Output exactly one term per line.
-- No bullets, numbering, headings, explanations, or commentary.
-"""
+- Preserve standard English spelling/capitalization where obvious.
+- Do not invent subject-related terms that are absent.
+- Maximum 40 terms.
+- Output one term per line.
+- No bullets, numbering, headings, or explanations.
 
-    audio = audio_input(client, audio_path)
+TRANSCRIPT:
+""" + transcript_text[:18000]
 
     def _request():
         return client.interactions.create(
             model=VOCAB_MODEL,
-            input=[
-                {"type": "text", "text": prompt},
-                audio,
-            ],
-            timeout=VOCAB_TIMEOUT_SECONDS,
+            input=prompt,
+            timeout=30,
         )
 
-    interaction = call_once(
-        f"Vocabulary discovery chunk {chunk_index:03d}",
-        _request
-    )
-    raw = (interaction.output_text or "").strip()
-    raw_file.write_text(raw, encoding="utf-8")
+    try:
+        interaction = call_once(
+            f"Text vocabulary extraction chunk {chunk_index:03d}",
+            _request
+        )
+        raw = (interaction.output_text or "").strip()
+        terms = parse_vocabulary(raw)[:40]
+    except Exception as exc:
+        print(f"    Vocabulary text extraction skipped: {exc}")
+        terms = []
 
-    terms = parse_vocabulary(raw)[:40]
     chunk_vocab_file.write_text(
         "\n".join(terms) + ("\n" if terms else ""),
         encoding="utf-8"
@@ -523,38 +526,33 @@ def transcribe_primary_chunk(
 
     extract_audio(source, start, duration, audio_path)
 
-    print("    Discovering vocabulary for this chunk...")
-    try:
-        chunk_vocabulary = discover_chunk_vocabulary(
-            client, audio_path, idx, out_dir
-        )
-    except Exception as exc:
-        # Vocabulary discovery is an enhancement, not a reason to lose the
-        # actual transcription. Continue with terms learned from earlier chunks.
-        print(
-            "    WARNING: vocabulary discovery failed/timed out once; "
-            "skipping it and continuing directly to transcription."
-        )
-        print(f"    Details: {exc}")
-        chunk_vocabulary = []
+    # Transcribe immediately using vocabulary accumulated from previous chunks.
+    # No second audio-model pass is performed.
+    vocabulary = list(global_vocabulary)[:MAX_VOCAB_TERMS]
+    if vocabulary:
+        print(f"    Using {len(vocabulary)} accumulated vocabulary terms.")
+    else:
+        print("    No accumulated vocabulary yet; transcribing directly.")
 
+    text = transcribe_audio(client, audio_path, vocabulary, mode="verbatim")
+
+    # Learn terminology from the TEXT result for subsequent chunks.
+    chunk_vocabulary = discover_terms_from_transcript(
+        client, text, idx, out_dir
+    )
     if chunk_vocabulary:
         print(
-            "    Terms: "
+            "    Learned terms for next chunks: "
             + ", ".join(chunk_vocabulary[:10])
             + (" ..." if len(chunk_vocabulary) > 10 else "")
         )
 
-    # Current-chunk terms get priority; previously discovered terms fill
-    # any remaining vocabulary slots.
     vocabulary = merge_vocab(
         global_vocabulary,
         chunk_vocabulary,
         MAX_VOCAB_TERMS
     )
     save_global_vocabulary(out_dir, vocabulary)
-
-    text = transcribe_audio(client, audio_path, vocabulary, mode="verbatim")
     metrics = qc_metrics(text, duration)
     reasons = primary_qc_reasons(metrics, duration)
 
@@ -707,7 +705,7 @@ def main() -> int:
         ][:MAX_VOCAB_TERMS]
 
     print(f"\nPrimary chunks: {len(chunks)} (~8 min each, 4 s overlap)")
-    print("Vocabulary: per chunk, inline audio, hard timeout, non-blocking fallback.")
+    print("Vocabulary: learned from completed transcript text; audio is transcribed only once.")
     print("Low-WPM QC: checked once on original chunks only (<35 WPM).")
     print("A flagged original chunk is split once into ~4-minute halves.\n")
 
