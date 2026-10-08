@@ -1,0 +1,6 @@
+LectureTranscriber Local
+Build: 2026-10-07
+Vocabulary model: gemini-3.8-flash
+STT model: gemini-3.5-transcribe
+Primary chunks: 8 minutes, 4-second overlap
+Low-WPM rescue: <35 WPM, original chunks only, split once
