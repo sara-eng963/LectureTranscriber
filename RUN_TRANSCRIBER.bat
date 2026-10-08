@@ -5,7 +5,7 @@ set PYTHONUTF8=1
 cd /d "%~dp0"
 
 echo ============================================================
-echo  Lecture Transcriber - Local
+echo  Lecture Transcriber - Local Whisper
 echo ============================================================
 echo.
 
@@ -45,9 +45,14 @@ if not exist ".venv\Scripts\python.exe" (
 )
 
 echo Checking Python dependencies...
-".venv\Scripts\python.exe" -m pip install --quiet --upgrade -r requirements.txt
-if errorlevel 1 goto :install_failed
+".venv\Scripts\python.exe" -c "import faster_whisper, imageio_ffmpeg" >nul 2>&1
+if errorlevel 1 (
+    echo Installing missing packages...
+    ".venv\Scripts\python.exe" -m pip install -r requirements.txt
+    if errorlevel 1 goto :install_failed
+)
 echo Dependencies ready.
+echo First transcription may download the Whisper model into the local models folder.
 echo.
 
 ".venv\Scripts\python.exe" transcribe.py %*

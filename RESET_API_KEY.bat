@@ -2,8 +2,8 @@
 cd /d "%~dp0"
 if exist ".env" (
     del ".env"
-    echo Saved Gemini API key removed.
+    echo Saved legacy API key file removed.
 ) else (
-    echo No saved API key was found.
+    echo No saved API key file was found.
 )
 pause

@@ -1,28 +1,25 @@
 LECTURE TRANSCRIBER - WINDOWS QUICK START
-==========================================
+=========================================
 
 WHAT IT DOES
 ------------
 Choose one lecture recording (MP4, M4A, MP3, WAV, MOV, MKV, etc.).
 
 The program automatically:
-1. extracts compact speech audio locally;
-2. uses Gemini 3.8 Flash to discover technical English vocabulary from the lecture;
-3. uses Gemini 3.5 Transcribe for Egyptian Arabic + English code-switching;
-4. transcribes in ~8-minute chunks;
-5. checks repetition, absurd output, and missing-text symptoms;
-6. checks low WPM ONLY on the original ~8-minute chunk;
-7. if an original chunk is under 35 WPM, splits it ONCE into ~4-minute halves;
-8. does NOT apply low-WPM splitting again to those 4-minute halves;
-9. saves progress after every chunk;
-10. resumes after disconnects/API interruptions instead of starting over.
+1. extracts clean 16 kHz mono audio chunks locally with FFmpeg;
+2. transcribes with faster-whisper on your laptop;
+3. uses VAD to ignore long silence and reduce classroom-noise hallucinations;
+4. uses a fixed Egyptian Arabic + English code-switching prompt;
+5. saves progress after every ~5-minute chunk;
+6. resumes after interruption instead of starting over;
+7. writes transcript.txt, qc_report.txt, segments.jsonl, chunk text files, and run_state.json.
 
-Your RTX 3050 is not used for model inference. Gemini runs remotely.
-Your laptop handles FFmpeg, files, QC and checkpointing.
+No Gemini API key is required. The first transcription may download the selected
+Whisper model into this project's local models folder. That folder is ignored by Git.
 
 FIRST RUN
 ---------
-1. Extract this ZIP to a permanent folder, for example:
+1. Extract this folder to a permanent location, for example:
    D:\University\LectureTranscriber_Local
 
 2. Double-click:
@@ -34,15 +31,7 @@ FIRST RUN
    https://www.python.org/downloads/windows/
    Enable "Add python.exe to PATH" during installation.
 
-5. The first run asks for a Gemini API key.
-   Get one from:
-   https://aistudio.google.com/apikey
-
-   Paste it into the terminal.
-   It is saved only in this folder as:
-   .env
-
-6. A file picker opens. Select the lecture recording.
+5. A file picker opens. Select the lecture recording.
 
 EVERY LATER RUN
 ---------------
@@ -56,15 +45,14 @@ transcripts\
   <lecture filename>\
     transcript.txt
     qc_report.txt
-    auto_vocabulary.txt
-    auto_vocabulary_raw.txt
+    segments.jsonl
     chunk_001_...
     chunk_002_...
     run_state.json
 
 RESUME
 ------
-If Wi-Fi, the API, or the terminal interrupts:
+If the terminal closes or Windows sleeps:
 run the SAME lecture file again.
 
 Completed chunks are skipped automatically.
@@ -76,18 +64,23 @@ Delete that lecture folder under transcripts\
 or run:
 .venv\Scripts\python.exe transcribe.py "D:\path\lecture.mp4" --force
 
-API KEY
--------
-Double-click RESET_API_KEY.bat to remove the locally saved API key.
-
-FREE-TIER NOTE
+USEFUL OPTIONS
 --------------
-The current Gemini free tier lists Gemini 3.8 Flash and Gemini 3.5 Transcribe
-input/output as free of charge, subject to Google project/account rate limits.
-Free-tier data may be used by Google to improve its products.
+Default model:
+.venv\Scripts\python.exe transcribe.py "D:\path\lecture.mp4"
 
-DO NOT SHARE
-------------
-.env
+Prefer Arabic as a language hint:
+.venv\Scripts\python.exe transcribe.py "D:\path\lecture.mp4" --language ar
 
-It contains your Gemini API key.
+Force CPU if CUDA libraries are not installed correctly:
+.venv\Scripts\python.exe transcribe.py "D:\path\lecture.mp4" --device cpu
+
+Try a more accurate but slower model:
+.venv\Scripts\python.exe transcribe.py "D:\path\lecture.mp4" --model large-v3
+
+NOTES
+-----
+RUN_TRANSCRIBER.bat uses the local Whisper pipeline.
+
+RESET_API_KEY.bat only removes an old .env file if one exists. The current
+pipeline does not need API keys.

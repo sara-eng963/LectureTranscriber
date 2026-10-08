@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import base64
-import getpass
 import json
 import os
 import re
@@ -12,39 +10,37 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
-VOCAB_MODEL = "gemini-3.8-flash"
-STT_MODEL = "gemini-3.5-transcribe"
 
-PRIMARY_CHUNK_SECONDS = 8 * 60
-PRIMARY_OVERLAP_SECONDS = 4
-LOW_WPM_THRESHOLD = 35.0
-HIGH_WPM_THRESHOLD = 220.0
-REPEAT_8GRAM_THRESHOLD = 8
-MIN_WORDS_LONG_CHUNK = 20
-HALF_OVERLAP_SECONDS = 2
+STATE_VERSION = 2
+BACKEND = "faster-whisper"
 
-LANGUAGE_CODES = ["ar-EG", "en-US"]
-MAX_VOCAB_TERMS = 100
-AUDIO_BITRATE = "48k"
-AUDIO_SAMPLE_RATE = "16000"
+DEFAULT_MODEL = "turbo"
+DEFAULT_CHUNK_SECONDS = 5 * 60
+DEFAULT_BEAM_SIZE = 5
+DEFAULT_LANGUAGE = "auto"
+DEFAULT_PROMPT = (
+    "This is an Egyptian Arabic university lecture. The speaker frequently "
+    "code-switches into English technical terminology, acronyms, library names, "
+    "model names, equations, and proper nouns. Transcribe verbatim. Keep Arabic "
+    "speech in Arabic script and keep English technical terms in Latin letters. "
+    "Do not translate. Do not summarize."
+)
 
-MAX_API_ATTEMPTS = 4
-RETRY_DELAYS_SECONDS = [5, 15, 30, 60]
-
-# Hard network deadlines: no Gemini request can hang forever.
-STT_TIMEOUT_SECONDS = 150
-INLINE_AUDIO_LIMIT_BYTES = 18 * 1024 * 1024  # stay safely under the 20 MB request limit
+LOW_WPM_THRESHOLD = 25.0
+HIGH_WPM_THRESHOLD = 230.0
+REPEAT_8GRAM_THRESHOLD = 6
+MIN_WORDS_LONG_CHUNK = 12
 
 SUPPORTED_EXTENSIONS = {
     ".mp4", ".m4a", ".mp3", ".wav", ".mov", ".mkv",
-    ".aac", ".flac", ".ogg", ".webm", ".mpeg", ".mpg"
+    ".aac", ".flac", ".ogg", ".webm", ".mpeg", ".mpg",
 }
 
 PROJECT_DIR = Path(__file__).resolve().parent
 TRANSCRIPTS_DIR = PROJECT_DIR / "transcripts"
-ENV_FILE = PROJECT_DIR / ".env"
+MODEL_CACHE_DIR = PROJECT_DIR / "models"
 
 
 def console_utf8() -> None:
@@ -68,43 +64,25 @@ def fmt_time(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def load_key() -> str:
-    key = os.getenv("GEMINI_API_KEY", "").strip()
-    if key:
-        return key
-
-    if ENV_FILE.exists():
-        for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
-            if line.strip().startswith("GEMINI_API_KEY="):
-                key = line.split("=", 1)[1].strip().strip('"').strip("'")
-                if key:
-                    os.environ["GEMINI_API_KEY"] = key
-                    return key
-
-    print("\nFirst run: paste your Gemini API key.")
-    print("Get one from Google AI Studio: https://aistudio.google.com/apikey")
-    print("The key is saved only in this project's local .env file.\n")
-    key = getpass.getpass("GEMINI_API_KEY: ").strip()
-    if not key:
-        raise RuntimeError("No API key provided.")
-
-    ENV_FILE.write_text(f"GEMINI_API_KEY={key}\n", encoding="utf-8")
-    os.environ["GEMINI_API_KEY"] = key
-    print("API key saved locally in .env.")
-    return key
+def parse_time_label(label: str) -> str:
+    return label.replace(":", "-")
 
 
 def choose_file_gui() -> Path:
     try:
         import tkinter as tk
         from tkinter import filedialog
+
         root = tk.Tk()
         root.withdraw()
         root.attributes("-topmost", True)
         filename = filedialog.askopenfilename(
             title="Choose a lecture recording",
             filetypes=[
-                ("Audio / Video", "*.mp4 *.m4a *.mp3 *.wav *.mov *.mkv *.aac *.flac *.ogg *.webm *.mpeg *.mpg"),
+                (
+                    "Audio / Video",
+                    "*.mp4 *.m4a *.mp3 *.wav *.mov *.mkv *.aac *.flac *.ogg *.webm *.mpeg *.mpg",
+                ),
                 ("All files", "*.*"),
             ],
         )
@@ -121,28 +99,33 @@ def choose_file_gui() -> Path:
 def get_ffmpeg() -> str:
     try:
         import imageio_ffmpeg
+
         return imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception as e:
+    except Exception as exc:
         raise RuntimeError(
-            "FFmpeg helper is unavailable. Run RUN_TRANSCRIBER.bat again so dependencies install."
-        ) from e
+            "FFmpeg helper is unavailable. Run RUN_TRANSCRIBER.bat so dependencies install."
+        ) from exc
 
 
-def run_ffmpeg(args: list[str], *, capture: bool = False) -> subprocess.CompletedProcess:
+def run_ffmpeg(args: list[str], *, capture: bool = False, timeout: float = 120.0) -> subprocess.CompletedProcess:
     cmd = [get_ffmpeg(), "-hide_banner"] + args
-    return subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
-        stderr=subprocess.PIPE if capture else subprocess.DEVNULL,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
+    try:
+        return subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+            stderr=subprocess.PIPE if capture else subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"FFmpeg timed out after {timeout:.0f}s.") from exc
 
 
 def get_duration_seconds(source: Path) -> float:
-    p = run_ffmpeg(["-i", str(source)], capture=True)
+    p = run_ffmpeg(["-i", str(source)], capture=True, timeout=45)
     text = (p.stderr or "") + "\n" + (p.stdout or "")
     match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", text)
     if not match:
@@ -152,7 +135,11 @@ def get_duration_seconds(source: Path) -> float:
 
 
 def extract_audio(source: Path, start: float, duration: float, out_path: Path) -> None:
+    if out_path.exists() and out_path.stat().st_size > 1000:
+        return
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    timeout = max(90.0, duration * 3.0 + 30.0)
     args = [
         "-y",
         "-ss", f"{max(0.0, start):.3f}",
@@ -160,275 +147,40 @@ def extract_audio(source: Path, start: float, duration: float, out_path: Path) -
         "-i", str(source),
         "-vn",
         "-ac", "1",
-        "-ar", AUDIO_SAMPLE_RATE,
-        "-b:a", AUDIO_BITRATE,
-        "-c:a", "libmp3lame",
+        "-ar", "16000",
+        "-c:a", "pcm_s16le",
         str(out_path),
     ]
-    p = run_ffmpeg(args, capture=True)
+    p = run_ffmpeg(args, capture=True, timeout=timeout)
     if p.returncode != 0 or not out_path.exists() or out_path.stat().st_size < 1000:
-        raise RuntimeError(f"FFmpeg failed while creating {out_path.name}:\n{p.stderr[-2000:]}")
+        tail = (p.stderr or "")[-2500:]
+        raise RuntimeError(f"FFmpeg failed while creating {out_path.name}:\n{tail}")
 
 
-def extract_full_audio(source: Path, out_path: Path, duration: float) -> None:
-    if out_path.exists() and out_path.stat().st_size > 1000:
-        return
-    print("Preparing compact speech audio...")
-    extract_audio(source, 0, duration + 1, out_path)
+def source_signature(source: Path) -> dict[str, Any]:
+    st = source.stat()
+    return {"name": source.name, "size": st.st_size, "mtime_ns": st.st_mtime_ns}
 
 
-def retryable_error(exc: Exception) -> bool:
-    text = f"{type(exc).__name__}: {exc}".lower()
-    markers = [
-        "429", "resource_exhausted", "rate limit", "quota",
-        "503", "500", "502", "504", "unavailable",
-        "timeout", "timed out", "connection", "temporarily",
-    ]
-    return any(m in text for m in markers)
-
-
-def call_with_retry(label: str, fn):
-    last = None
-    for attempt in range(MAX_API_ATTEMPTS):
-        try:
-            return fn()
-        except Exception as exc:
-            last = exc
-            if not retryable_error(exc) or attempt == MAX_API_ATTEMPTS - 1:
-                break
-            delay = RETRY_DELAYS_SECONDS[min(attempt, len(RETRY_DELAYS_SECONDS) - 1)]
-            print(
-                f"{label}: temporary API/network error "
-                f"({type(exc).__name__}: {exc}). Retrying in {delay}s..."
-            )
-            time.sleep(delay)
-    raise RuntimeError(
-        f"{label} failed after retries.\n"
-        f"Progress already saved. Run the same lecture again later to resume.\n"
-        f"Last error: {last}"
-    ) from last
-
-
-def call_once(label: str, fn):
-    """Single best-effort API call for optional enhancement stages."""
-    try:
-        return fn()
-    except Exception as exc:
-        raise RuntimeError(
-            f"{label} failed: {type(exc).__name__}: {exc}"
-        ) from exc
-
-
-def upload_file(client, path: Path):
-    """Fallback for unexpectedly large audio. Normal chunks are sent inline."""
-    return call_with_retry(
-        f"Upload {path.name}",
-        lambda: client.files.upload(file=str(path)),
-    )
-
-
-def audio_input(client, path: Path) -> dict[str, str]:
-    """
-    Build Gemini audio input.
-
-    Our 48 kbps 8-minute MP3 chunks are only a few MB, so they are sent
-    inline. This avoids a separate Files API upload and the stalls we saw
-    there. Files API is retained only as a safety fallback for >18 MB.
-    """
-    size = path.stat().st_size
-    if size <= INLINE_AUDIO_LIMIT_BYTES:
-        data = base64.b64encode(path.read_bytes()).decode("ascii")
-        return {
-            "type": "audio",
-            "data": data,
-            "mime_type": "audio/mp3",
-        }
-
-    print(
-        f"    {path.name} is {size / (1024**2):.1f} MB; "
-        "using Files API fallback."
-    )
-    uploaded = upload_file(client, path)
-    return {
-        "type": "audio",
-        "uri": uploaded.uri,
-        "mime_type": uploaded.mime_type,
-    }
-
-
-def normalize_vocab_line(line: str) -> str:
-    line = line.strip()
-    line = re.sub(r"^```(?:text)?\s*", "", line, flags=re.I)
-    line = line.replace("```", "").strip()
-    line = re.sub(r"^\s*(?:[-*•]+|\d+[\.\):])\s*", "", line)
-    return line.strip(" \t\"'`")
-
-
-def parse_vocabulary(raw: str) -> list[str]:
-    terms: list[str] = []
-    seen: set[str] = set()
-    for line in raw.splitlines():
-        term = normalize_vocab_line(line)
-        if not term or not re.search(r"[A-Za-z]", term):
-            continue
-        if len(term) > 80 or len(term.split()) > 8:
-            continue
-        key = term.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        terms.append(term)
-        if len(terms) >= MAX_VOCAB_TERMS:
+def build_chunks(total_duration: float, chunk_seconds: int) -> list[dict[str, float]]:
+    chunks: list[dict[str, float]] = []
+    start = 0.0
+    index = 1
+    while start < total_duration - 0.25:
+        end = min(start + chunk_seconds, total_duration)
+        chunks.append({"index": index, "start": start, "end": end, "duration": end - start})
+        if end >= total_duration:
             break
-    return terms
+        start = end
+        index += 1
+    return chunks
 
 
-VOCAB_PROMPT = """Listen carefully to this university lecture recording.
+def save_state(path: Path, state: dict[str, Any]) -> None:
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
 
-The lecturer primarily speaks Egyptian Arabic and frequently code-switches into English technical terminology.
-
-Your ONLY task is to identify technical English terms, acronyms, model names, dataset names, software/library names, researcher/proper names, and specialized English phrases that are ACTUALLY SPOKEN or clearly audible in this recording.
-
-Rules:
-- Do not summarize the lecture.
-- Do not infer extra vocabulary merely because it belongs to the subject.
-- Preserve the likely standard English spelling/capitalization.
-- Prefer specific domain terms over ordinary English words.
-- Include variants only when genuinely useful.
-- Maximum 100 terms.
-- Output exactly one term per line.
-- No bullets, numbering, headings, explanations, or commentary.
-"""
-
-
-
-def merge_vocab(existing: list[str], new_terms: list[str], limit: int = MAX_VOCAB_TERMS) -> list[str]:
-    """Merge vocabulary case-insensitively while preserving order."""
-    merged: list[str] = []
-    seen: set[str] = set()
-    for term in list(new_terms) + list(existing):
-        t = term.strip()
-        if not t:
-            continue
-        key = t.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        merged.append(t)
-        if len(merged) >= limit:
-            break
-    return merged
-
-
-def save_global_vocabulary(out_dir: Path, terms: list[str]) -> None:
-    (out_dir / "auto_vocabulary.txt").write_text(
-        "\n".join(terms) + ("\n" if terms else ""),
-        encoding="utf-8"
-    )
-
-
-
-def discover_terms_from_transcript(
-    client,
-    transcript_text: str,
-    chunk_index: int,
-    out_dir: Path,
-) -> list[str]:
-    """
-    Fast TEXT-only vocabulary discovery after transcription.
-
-    This avoids sending the same audio to two different models. Any technical
-    terms recovered from chunk N are carried forward as custom vocabulary for
-    chunk N+1.
-    """
-    chunk_vocab_file = out_dir / f"vocab_chunk_{chunk_index:03d}.txt"
-
-    if chunk_vocab_file.exists():
-        saved = [
-            x.strip()
-            for x in chunk_vocab_file.read_text(encoding="utf-8").splitlines()
-            if x.strip()
-        ]
-        if saved:
-            return saved
-
-    if not transcript_text.strip():
-        return []
-
-    prompt = """Extract technical English terms, acronyms, model names, dataset names,
-software/library names, researcher/proper names, and specialized English phrases
-that actually appear in the transcript below.
-
-The transcript is from an Egyptian Arabic university lecture with English
-code-switching.
-
-Rules:
-- Do not summarize.
-- Preserve standard English spelling/capitalization where obvious.
-- Do not invent subject-related terms that are absent.
-- Maximum 40 terms.
-- Output one term per line.
-- No bullets, numbering, headings, or explanations.
-
-TRANSCRIPT:
-""" + transcript_text[:18000]
-
-    def _request():
-        return client.interactions.create(
-            model=VOCAB_MODEL,
-            input=prompt,
-            timeout=30,
-        )
-
-    try:
-        interaction = call_once(
-            f"Text vocabulary extraction chunk {chunk_index:03d}",
-            _request
-        )
-        raw = (interaction.output_text or "").strip()
-        terms = parse_vocabulary(raw)[:40]
-    except Exception as exc:
-        print(f"    Vocabulary text extraction skipped: {exc}")
-        terms = []
-
-    chunk_vocab_file.write_text(
-        "\n".join(terms) + ("\n" if terms else ""),
-        encoding="utf-8"
-    )
-    return terms
-
-
-def transcribe_audio(client, audio_path: Path, vocabulary: list[str], mode: str = "verbatim") -> str:
-    """
-    Transcribe one audio chunk.
-
-    Gemini's official transcription examples use the Files API for audio.
-    Upload once, then pass the returned URI to gemini-3.5-transcribe.
-    """
-    size_mb = audio_path.stat().st_size / (1024 ** 2)
-    print(f"    Uploading {audio_path.name} ({size_mb:.1f} MB) for STT...")
-    uploaded = upload_file(client, audio_path)
-    print("    Audio uploaded; waiting for Gemini transcription...")
-
-    tcfg: dict[str, Any] = {"language_codes": LANGUAGE_CODES}
-    if vocabulary:
-        tcfg["custom_vocabulary"] = vocabulary[:MAX_VOCAB_TERMS]
-    tcfg["mode"] = "smart" if mode == "smart" else {"type": "verbatim"}
-
-    def _request():
-        return client.interactions.create(
-            model=STT_MODEL,
-            input=[{
-                "type": "audio",
-                "uri": uploaded.uri,
-                "mime_type": uploaded.mime_type,
-            }],
-            generation_config={"transcription_config": tcfg},
-            timeout=STT_TIMEOUT_SECONDS,
-        )
-
-    interaction = call_once(f"Transcribe {audio_path.name}", _request)
-    return (interaction.output_text or "").strip()
 
 def word_count(text: str) -> int:
     return len(re.findall(r"\S+", text))
@@ -442,266 +194,345 @@ def max_ngram_repeat(text: str, n: int = 8) -> int:
     counts: dict[tuple[str, ...], int] = {}
     maximum = 1
     for i in range(len(words) - n + 1):
-        gram = tuple(words[i:i+n])
+        gram = tuple(words[i:i + n])
         counts[gram] = counts.get(gram, 0) + 1
         maximum = max(maximum, counts[gram])
     return maximum
 
 
-def qc_metrics(text: str, duration_s: float) -> dict[str, Any]:
+def weighted_mean(items: Iterable[tuple[float, float]]) -> float | None:
+    total_weight = 0.0
+    total_value = 0.0
+    for value, weight in items:
+        if value is None:
+            continue
+        w = max(weight, 0.0)
+        total_weight += w
+        total_value += value * w
+    if total_weight <= 0:
+        return None
+    return total_value / total_weight
+
+
+def qc_metrics(text: str, duration_s: float, segments: list[dict[str, Any]]) -> dict[str, Any]:
     words = word_count(text)
     minutes = max(duration_s / 60.0, 0.01)
+    speech_seconds = sum(max(0.0, s["end"] - s["start"]) for s in segments)
+    avg_logprob = weighted_mean(
+        (s.get("avg_logprob"), max(0.01, s["end"] - s["start"]))
+        for s in segments
+        if s.get("avg_logprob") is not None
+    )
+    no_speech_prob = weighted_mean(
+        (s.get("no_speech_prob"), max(0.01, s["end"] - s["start"]))
+        for s in segments
+        if s.get("no_speech_prob") is not None
+    )
+    compression_ratio = max(
+        [s.get("compression_ratio", 0.0) or 0.0 for s in segments] or [0.0]
+    )
     return {
         "words": words,
         "wpm": words / minutes,
+        "speech_seconds": speech_seconds,
+        "speech_ratio": speech_seconds / max(duration_s, 0.01),
         "repeat8": max_ngram_repeat(text, 8),
+        "avg_logprob": avg_logprob,
+        "no_speech_prob": no_speech_prob,
+        "max_compression_ratio": compression_ratio,
+        "segments": len(segments),
     }
 
 
-def core_qc_reasons(metrics: dict[str, Any], duration_s: float) -> list[str]:
+def qc_reasons(metrics: dict[str, Any], duration_s: float) -> list[str]:
     reasons: list[str] = []
     if duration_s >= 60 and metrics["words"] < MIN_WORDS_LONG_CHUNK:
         reasons.append("almost-empty")
+    if duration_s >= 180 and metrics["wpm"] < LOW_WPM_THRESHOLD and metrics["speech_ratio"] > 0.18:
+        reasons.append("low-wpm")
     if metrics["wpm"] > HIGH_WPM_THRESHOLD:
         reasons.append("implausibly-high-wpm")
     if metrics["repeat8"] >= REPEAT_8GRAM_THRESHOLD:
         reasons.append("repetition-loop")
+    avg_logprob = metrics.get("avg_logprob")
+    if avg_logprob is not None and avg_logprob < -1.25 and metrics["words"] > 10:
+        reasons.append("low-confidence")
+    if metrics.get("max_compression_ratio", 0.0) > 3.2 and metrics["words"] > 20:
+        reasons.append("compression-loop-risk")
     return reasons
 
 
-def primary_qc_reasons(metrics: dict[str, Any], duration_s: float) -> list[str]:
-    reasons = core_qc_reasons(metrics, duration_s)
-    if duration_s >= 6 * 60 and metrics["wpm"] < LOW_WPM_THRESHOLD:
-        reasons.append("low-wpm-one-time-check")
-    return reasons
-
-
-def save_state(path: Path, state: dict[str, Any]) -> None:
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
-
-
-def source_signature(source: Path) -> dict[str, Any]:
-    st = source.stat()
-    return {"name": source.name, "size": st.st_size, "mtime_ns": st.st_mtime_ns}
-
-
-def build_primary_chunks(total_duration: float) -> list[dict[str, float]]:
-    chunks = []
-    start = 0.0
-    idx = 1
-    while start < total_duration - 0.25:
-        end = min(start + PRIMARY_CHUNK_SECONDS, total_duration)
-        chunks.append({"index": idx, "start": start, "end": end, "duration": end - start})
-        if end >= total_duration:
-            break
-        start = end - PRIMARY_OVERLAP_SECONDS
-        idx += 1
-    return chunks
-
-
-def transcribe_half_once(
-    client, source: Path, vocabulary: list[str], work_dir: Path,
-    chunk_index: int, label: str, start: float, end: float
-) -> dict[str, Any]:
-    duration = max(0.1, end - start)
-    audio_path = work_dir / f"chunk_{chunk_index:03d}_{label}.mp3"
-    extract_audio(source, start, duration, audio_path)
-
-    text = transcribe_audio(client, audio_path, vocabulary, mode="verbatim")
-    metrics = qc_metrics(text, duration)
-    reasons = core_qc_reasons(metrics, duration)  # deliberately NO low-WPM check
-    mode = "verbatim-4m"
-
-    if reasons:
-        print(f"      {label}: core QC flagged {', '.join(reasons)}; trying Smart once.")
-        smart = transcribe_audio(client, audio_path, vocabulary, mode="smart")
-        smart_metrics = qc_metrics(smart, duration)
-        smart_reasons = core_qc_reasons(smart_metrics, duration)
-        if len(smart_reasons) <= len(reasons):
-            text, metrics, reasons, mode = smart, smart_metrics, smart_reasons, "smart-4m"
-
+def segment_to_dict(segment: Any, chunk_start: float) -> dict[str, Any]:
+    start = chunk_start + float(segment.start or 0.0)
+    end = chunk_start + float(segment.end or segment.start or 0.0)
     return {
-        "start": start, "end": end, "duration": duration, "mode": mode,
-        "text": text, "metrics": metrics, "reasons": reasons,
-        "status": "OK" if not reasons else "NEEDS_REVIEW",
+        "start": start,
+        "end": end,
+        "text": (segment.text or "").strip(),
+        "avg_logprob": getattr(segment, "avg_logprob", None),
+        "no_speech_prob": getattr(segment, "no_speech_prob", None),
+        "compression_ratio": getattr(segment, "compression_ratio", None),
     }
 
 
-def transcribe_primary_chunk(
-    client, source: Path, global_vocabulary: list[str],
-    work_dir: Path, out_dir: Path, chunk: dict[str, float]
-) -> tuple[dict[str, Any], list[str]]:
-    idx = int(chunk["index"])
-    start, end, duration = chunk["start"], chunk["end"], chunk["duration"]
-    audio_path = work_dir / f"chunk_{idx:03d}.mp3"
+def format_segment_text(segments: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for segment in segments:
+        text = segment.get("text", "").strip()
+        if not text:
+            continue
+        lines.append(f"[{fmt_time(segment['start'])} - {fmt_time(segment['end'])}] {text}")
+    return "\n".join(lines).strip()
 
-    extract_audio(source, start, duration, audio_path)
 
-    # Transcribe immediately using vocabulary accumulated from previous chunks.
-    # No second audio-model pass is performed.
-    vocabulary = list(global_vocabulary)[:MAX_VOCAB_TERMS]
-    if vocabulary:
-        print(f"    Using {len(vocabulary)} accumulated vocabulary terms.")
-    else:
-        print("    No accumulated vocabulary yet; transcribing directly.")
-
+def import_faster_whisper():
     try:
-        text = transcribe_audio(client, audio_path, vocabulary, mode="verbatim")
-    except Exception as exc:
-        print(f"    Primary 8-minute STT failed/stalled: {exc}")
-        print("    Falling back immediately to two ~4-minute transcription calls.")
+        from faster_whisper import WhisperModel
 
-        midpoint = start + duration / 2.0
-        h1_start = start
-        h1_end = min(end, midpoint + HALF_OVERLAP_SECONDS / 2.0)
-        h2_start = max(start, midpoint - HALF_OVERLAP_SECONDS / 2.0)
-        h2_end = end
+        return WhisperModel
+    except ImportError as exc:
+        raise RuntimeError(
+            "faster-whisper is not installed. Run RUN_TRANSCRIBER.bat to install dependencies."
+        ) from exc
 
-        half1 = transcribe_half_once(
-            client, source, vocabulary, work_dir, idx, "A",
-            h1_start, h1_end
-        )
-        half2 = transcribe_half_once(
-            client, source, vocabulary, work_dir, idx, "B",
-            h2_start, h2_end
-        )
 
-        combined_text = (
-            f"[{fmt_time(half1['start'])}–{fmt_time(half1['end'])} | {half1['mode']}]\n"
-            f"{half1['text'].strip()}\n\n"
-            f"[{fmt_time(half2['start'])}–{fmt_time(half2['end'])} | {half2['mode']}]\n"
-            f"{half2['text'].strip()}"
-        ).strip()
+def model_candidates(device: str, compute_type: str) -> list[tuple[str, str]]:
+    if device != "auto":
+        compute = compute_type
+        if compute == "auto":
+            compute = "int8_float16" if device == "cuda" else "int8"
+        return [(device, compute)]
 
-        chunk_vocabulary = discover_terms_from_transcript(
-            client, combined_text, idx, out_dir
-        )
-        vocabulary = merge_vocab(
-            global_vocabulary,
-            chunk_vocabulary,
-            MAX_VOCAB_TERMS
-        )
-        save_global_vocabulary(out_dir, vocabulary)
+    if compute_type != "auto":
+        return [("cuda", compute_type), ("cpu", compute_type)]
 
-        combined_metrics = qc_metrics(combined_text, duration)
-        status = (
-            "OK"
-            if half1["status"] == "OK" and half2["status"] == "OK"
-            else "NEEDS_REVIEW"
-        )
+    return [
+        ("cuda", "int8_float16"),
+        ("cuda", "float16"),
+        ("cpu", "int8"),
+    ]
 
-        return ({
-            "index": idx,
-            "start": start,
-            "end": end,
-            "duration": duration,
-            "mode": "split-after-stt-failure",
-            "text": combined_text,
-            "metrics": combined_metrics,
-            "reasons": ["primary-stt-failure"],
-            "status": status,
-            "split": True,
-            "halves": [half1, half2],
-            "chunk_vocabulary": chunk_vocabulary,
-        }, vocabulary)
 
-    # Learn terminology from the TEXT result for subsequent chunks.
-    chunk_vocabulary = discover_terms_from_transcript(
-        client, text, idx, out_dir
+def load_model(model_name: str, device: str, compute_type: str):
+    WhisperModel = import_faster_whisper()
+    MODEL_CACHE_DIR.mkdir(exist_ok=True)
+    errors: list[str] = []
+
+    print("Loading Whisper model...")
+    print(f"Model cache: {MODEL_CACHE_DIR}")
+    for candidate_device, candidate_compute in model_candidates(device, compute_type):
+        try:
+            print(f"Trying {model_name} on {candidate_device} ({candidate_compute})...")
+            model = WhisperModel(
+                model_name,
+                device=candidate_device,
+                compute_type=candidate_compute,
+                download_root=str(MODEL_CACHE_DIR),
+            )
+            return model, candidate_device, candidate_compute
+        except Exception as exc:
+            errors.append(f"{candidate_device}/{candidate_compute}: {type(exc).__name__}: {exc}")
+            print(f"  Could not use {candidate_device}/{candidate_compute}: {exc}")
+
+    joined = "\n".join(f"- {e}" for e in errors)
+    raise RuntimeError(f"Could not load Whisper model with any device/compute setting:\n{joined}")
+
+
+def transcribe_chunk(
+    model: Any,
+    audio_path: Path,
+    chunk_start: float,
+    *,
+    language: str,
+    beam_size: int,
+    prompt: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    language_arg = None if language == "auto" else language
+    segments_iter, info = model.transcribe(
+        str(audio_path),
+        task="transcribe",
+        language=language_arg,
+        beam_size=beam_size,
+        temperature=[0.0, 0.2, 0.4, 0.6],
+        condition_on_previous_text=False,
+        initial_prompt=prompt,
+        vad_filter=True,
+        vad_parameters={
+            "min_silence_duration_ms": 500,
+            "speech_pad_ms": 200,
+        },
+        no_speech_threshold=0.65,
+        compression_ratio_threshold=2.4,
+        log_prob_threshold=-1.0,
+        word_timestamps=False,
     )
-    if chunk_vocabulary:
-        print(
-            "    Learned terms for next chunks: "
-            + ", ".join(chunk_vocabulary[:10])
-            + (" ..." if len(chunk_vocabulary) > 10 else "")
-        )
-
-    vocabulary = merge_vocab(
-        global_vocabulary,
-        chunk_vocabulary,
-        MAX_VOCAB_TERMS
-    )
-    save_global_vocabulary(out_dir, vocabulary)
-    metrics = qc_metrics(text, duration)
-    reasons = primary_qc_reasons(metrics, duration)
-
-    if not reasons:
-        return ({
-            "index": idx, "start": start, "end": end, "duration": duration,
-            "mode": "verbatim", "text": text, "metrics": metrics,
-            "reasons": [], "status": "OK", "split": False,
-            "chunk_vocabulary": chunk_vocabulary,
-        }, vocabulary)
-
-    print(f"    QC flagged: {', '.join(reasons)}")
-    print("    Retrying this chunk ONCE as two ~4-minute pieces.")
-
-    midpoint = start + duration / 2.0
-    h1_start, h1_end = start, min(end, midpoint + HALF_OVERLAP_SECONDS / 2.0)
-    h2_start, h2_end = max(start, midpoint - HALF_OVERLAP_SECONDS / 2.0), end
-
-    half1 = transcribe_half_once(client, source, vocabulary, work_dir, idx, "A", h1_start, h1_end)
-    half2 = transcribe_half_once(client, source, vocabulary, work_dir, idx, "B", h2_start, h2_end)
-
-    combined_text = (
-        f"[{fmt_time(half1['start'])}–{fmt_time(half1['end'])} | {half1['mode']}]\n"
-        f"{half1['text'].strip()}\n\n"
-        f"[{fmt_time(half2['start'])}–{fmt_time(half2['end'])} | {half2['mode']}]\n"
-        f"{half2['text'].strip()}"
-    ).strip()
-
-    combined_metrics = qc_metrics(combined_text, duration)
-    status = "OK" if half1["status"] == "OK" and half2["status"] == "OK" else "NEEDS_REVIEW"
-
-    return ({
-        "index": idx, "start": start, "end": end, "duration": duration,
-        "mode": "split-once", "text": combined_text, "metrics": combined_metrics,
-        "reasons": reasons, "status": status, "split": True,
-        "halves": [half1, half2],
-        "chunk_vocabulary": chunk_vocabulary,
-    }, vocabulary)
+    segments = [segment_to_dict(segment, chunk_start) for segment in segments_iter]
+    info_dict = {
+        "language": getattr(info, "language", None),
+        "language_probability": getattr(info, "language_probability", None),
+        "duration": getattr(info, "duration", None),
+        "duration_after_vad": getattr(info, "duration_after_vad", None),
+    }
+    return segments, info_dict
 
 
 def write_outputs(out_dir: Path, state: dict[str, Any]) -> None:
     entries = sorted(state.get("chunks", {}).values(), key=lambda x: int(x["index"]))
-    transcript_parts = []
-    qc_lines = ["chunk\tstart\tend\tmode\twords\twpm\trepetition\tstatus\tnote"]
+    transcript_parts: list[str] = []
+    qc_lines = [
+        "chunk\tstart\tend\tmodel\tdevice\tcompute\tlanguage\tsegments\twords\twpm\tspeech_ratio\tavg_logprob\tno_speech_prob\trepeat8\tstatus\tnote"
+    ]
+    jsonl_lines: list[str] = []
 
-    for e in entries:
-        start_s, end_s = fmt_time(e["start"]), fmt_time(e["end"])
+    for entry in entries:
+        start_s = fmt_time(entry["start"])
+        end_s = fmt_time(entry["end"])
+        text = entry.get("text", "").strip()
         transcript_parts.append(
-            f"===== {start_s}–{end_s} | {e['mode']} =====\n{e.get('text','').strip()}"
+            f"===== {start_s} - {end_s} | {entry.get('backend', BACKEND)}:{entry.get('model')} =====\n{text}"
         )
-        m = e["metrics"]
-        note = ",".join(e.get("reasons", [])) if e.get("reasons") else "-"
-        qc_lines.append(
-            f"{int(e['index']):03d}\t{start_s}\t{end_s}\t{e['mode']}\t"
-            f"{m['words']} words\t{m['wpm']:.1f} wpm\trepeat8={m['repeat8']}\t"
-            f"{e['status']}\t{note}"
-        )
-        chunk_txt = out_dir / (
-            f"chunk_{int(e['index']):03d}_{start_s.replace(':','-')}_{end_s.replace(':','-')}.txt"
-        )
-        chunk_txt.write_text(e.get("text", "").strip() + "\n", encoding="utf-8")
 
-    (out_dir / "transcript.txt").write_text(
-        "\n\n".join(transcript_parts).strip() + "\n", encoding="utf-8"
+        m = entry["metrics"]
+        note = ",".join(entry.get("reasons", [])) if entry.get("reasons") else "-"
+        avg_logprob = m.get("avg_logprob")
+        no_speech_prob = m.get("no_speech_prob")
+        avg_logprob_s = f"{avg_logprob:.3f}" if avg_logprob is not None else "-"
+        no_speech_prob_s = f"{no_speech_prob:.3f}" if no_speech_prob is not None else "-"
+        qc_lines.append(
+            f"{int(entry['index']):03d}\t{start_s}\t{end_s}\t"
+            f"{entry.get('model')}\t{entry.get('device')}\t{entry.get('compute_type')}\t"
+            f"{entry.get('detected_language') or '-'}\t{m['segments']}\t{m['words']}\t"
+            f"{m['wpm']:.1f}\t{m['speech_ratio']:.2f}\t"
+            f"{avg_logprob_s}\t{no_speech_prob_s}\t{m['repeat8']}\t{entry['status']}\t{note}"
+        )
+
+        chunk_txt = out_dir / f"chunk_{int(entry['index']):03d}_{parse_time_label(start_s)}_{parse_time_label(end_s)}.txt"
+        chunk_txt.write_text(text + ("\n" if text else ""), encoding="utf-8")
+
+        for segment in entry.get("segments", []):
+            jsonl_lines.append(json.dumps({
+                "chunk": int(entry["index"]),
+                "start": segment["start"],
+                "end": segment["end"],
+                "text": segment.get("text", ""),
+                "avg_logprob": segment.get("avg_logprob"),
+                "no_speech_prob": segment.get("no_speech_prob"),
+                "compression_ratio": segment.get("compression_ratio"),
+            }, ensure_ascii=False))
+
+    transcript_text = "\n\n".join(part.strip() for part in transcript_parts if part.strip()).strip()
+    (out_dir / "transcript.txt").write_text(transcript_text + ("\n" if transcript_text else ""), encoding="utf-8")
+    (out_dir / "qc_report.txt").write_text("\n".join(qc_lines) + "\n", encoding="utf-8")
+    (out_dir / "segments.jsonl").write_text("\n".join(jsonl_lines) + ("\n" if jsonl_lines else ""), encoding="utf-8")
+
+
+def resolve_output_dir(source: Path, force: bool) -> Path:
+    base = TRANSCRIPTS_DIR / safe_name(source.stem)
+    if force:
+        return base
+
+    state_path = base / "run_state.json"
+    if not state_path.exists():
+        return base
+
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return base
+
+    if state.get("backend") == BACKEND and state.get("version") == STATE_VERSION:
+        return base
+
+    return TRANSCRIPTS_DIR / f"{safe_name(source.stem)}_local_whisper"
+
+
+def make_settings(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "backend": BACKEND,
+        "model": args.model,
+        "chunk_seconds": int(args.chunk_minutes * 60),
+        "language": args.language,
+        "beam_size": args.beam_size,
+        "prompt": args.prompt,
+    }
+
+
+def load_or_create_state(
+    state_path: Path,
+    source: Path,
+    settings: dict[str, Any],
+    duration: float,
+) -> dict[str, Any]:
+    sig = source_signature(source)
+    if state_path.exists():
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        if state.get("source") != sig:
+            raise RuntimeError(
+                "This output folder belongs to a different source file. "
+                "Rename the recording, delete the old transcript folder, or use --force."
+            )
+        if state.get("backend") != BACKEND or state.get("version") != STATE_VERSION:
+            raise RuntimeError(
+                "This run_state.json belongs to the older Gemini pipeline. "
+                "The local Whisper run should have been routed to a separate folder."
+            )
+        old_settings = state.get("settings", {})
+        if old_settings != settings and state.get("chunks"):
+            raise RuntimeError(
+                "This lecture already has partial progress with different settings. "
+                "Rerun without changing options, or use --force to start over."
+            )
+        state["duration_seconds"] = duration
+        return state
+
+    state = {
+        "version": STATE_VERSION,
+        "backend": BACKEND,
+        "source": sig,
+        "settings": settings,
+        "duration_seconds": duration,
+        "chunks": {},
+        "complete": False,
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    save_state(state_path, state)
+    return state
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Local Egyptian Arabic + English lecture transcription using faster-whisper."
     )
-    (out_dir / "qc_report.txt").write_text(
-        "\n".join(qc_lines) + "\n", encoding="utf-8"
-    )
+    parser.add_argument("recording", nargs="?", help="Path to audio/video lecture recording")
+    parser.add_argument("--force", action="store_true", help="Start this lecture over from scratch.")
+    parser.add_argument("--model", default=os.getenv("WHISPER_MODEL", DEFAULT_MODEL),
+                        help=f"faster-whisper model name (default: {DEFAULT_MODEL}).")
+    parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default=os.getenv("WHISPER_DEVICE", "auto"),
+                        help="Inference device (default: auto).")
+    parser.add_argument("--compute-type", default=os.getenv("WHISPER_COMPUTE_TYPE", "auto"),
+                        help="Compute type, e.g. int8_float16, float16, int8 (default: auto).")
+    parser.add_argument("--language", default=os.getenv("WHISPER_LANGUAGE", DEFAULT_LANGUAGE),
+                        help="Language hint: auto or Whisper language code such as ar/en (default: auto).")
+    parser.add_argument("--chunk-minutes", type=float, default=float(os.getenv("CHUNK_MINUTES", DEFAULT_CHUNK_SECONDS / 60)),
+                        help="Checkpoint chunk size in minutes (default: 5).")
+    parser.add_argument("--beam-size", type=int, default=int(os.getenv("WHISPER_BEAM_SIZE", DEFAULT_BEAM_SIZE)),
+                        help="Whisper beam size (default: 5).")
+    parser.add_argument("--prompt", default=os.getenv("WHISPER_PROMPT", DEFAULT_PROMPT),
+                        help="Initial prompt used to preserve Arabic/English code-switching.")
+    parser.add_argument("--keep-working", action="store_true", help="Keep extracted WAV chunks after completion.")
+    return parser.parse_args()
 
 
 def main() -> int:
     console_utf8()
-    parser = argparse.ArgumentParser(
-        description="Automatic Egyptian Arabic + English university lecture transcription."
-    )
-    parser.add_argument("recording", nargs="?", help="Path to audio/video lecture recording")
-    parser.add_argument("--force", action="store_true", help="Start this lecture over from scratch.")
-    args = parser.parse_args()
+    args = parse_args()
+
+    if args.chunk_minutes <= 0:
+        print("ERROR: --chunk-minutes must be positive.")
+        return 2
+    if args.beam_size <= 0:
+        print("ERROR: --beam-size must be positive.")
+        return 2
 
     source = Path(args.recording.strip('"')) if args.recording else choose_file_gui()
     source = source.expanduser().resolve()
@@ -713,7 +544,7 @@ def main() -> int:
         print(f"\nWARNING: Unusual extension {source.suffix}; FFmpeg will still try.")
 
     TRANSCRIPTS_DIR.mkdir(exist_ok=True)
-    out_dir = TRANSCRIPTS_DIR / safe_name(source.stem)
+    out_dir = resolve_output_dir(source, args.force)
     if args.force and out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -721,116 +552,104 @@ def main() -> int:
     work_dir.mkdir(exist_ok=True)
     state_path = out_dir / "run_state.json"
 
-    sig = source_signature(source)
-    if state_path.exists():
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        if state.get("source") != sig:
-            print("\nERROR: This output folder belongs to a different source file.")
-            print("Rename the recording, delete the old transcript folder, or use --force.")
-            return 3
-    else:
-        state = {
-            "version": 1,
-            "source": sig,
-            "models": {"vocabulary": VOCAB_MODEL, "transcription": STT_MODEL},
-            "chunks": {},
-            "complete": False,
-        }
-        save_state(state_path, state)
-
     print("\n" + "=" * 68)
-    print("LECTURE TRANSCRIBER")
+    print("LECTURE TRANSCRIBER - LOCAL WHISPER")
     print("=" * 68)
     print(f"Recording : {source}")
     print(f"Output    : {out_dir}")
-    print("GPU       : not required")
-    print(f"STT       : {STT_MODEL}")
-    print(f"Vocabulary: {VOCAB_MODEL}")
+    print("Backend   : faster-whisper (local, no API key required)")
+    print(f"Model     : {args.model}")
+    print(f"Language  : {args.language}")
 
-    api_key = load_key()
-    try:
-        from google import genai
-        from google.genai import types
-    except ImportError:
-        print("\nERROR: google-genai is not installed. Run RUN_TRANSCRIBER.bat again.")
-        return 4
-
-    # IMPORTANT: the Interactions SDK has its own hidden retry policy by default.
-    # Disable it so our explicit timeouts/fallbacks regain control immediately.
-    client = genai.Client(
-        api_key=api_key,
-        http_options=types.HttpOptions(
-            timeout=150_000,  # HttpOptions timeout is milliseconds.
-            retry_options=types.HttpRetryOptions(attempts=0),
-        ),
-    )
-
-    duration = state.get("duration_seconds") or get_duration_seconds(source)
-    state["duration_seconds"] = duration
-    save_state(state_path, state)
+    duration = get_duration_seconds(source)
     print(f"Duration  : {fmt_time(duration)}")
+
+    settings = make_settings(args)
+    state = load_or_create_state(state_path, source, settings, duration)
 
     if state.get("complete") and (out_dir / "transcript.txt").exists():
         print("\nThis lecture is already complete.")
         print(f"Transcript: {out_dir / 'transcript.txt'}")
         return 0
 
-    chunks = build_primary_chunks(duration)
-    global_vocabulary = list(state.get("vocabulary", []))
-    vocab_file = out_dir / "auto_vocabulary.txt"
-    if not global_vocabulary and vocab_file.exists():
-        global_vocabulary = [
-            x.strip()
-            for x in vocab_file.read_text(encoding="utf-8").splitlines()
-            if x.strip()
-        ][:MAX_VOCAB_TERMS]
+    chunks = build_chunks(duration, int(args.chunk_minutes * 60))
+    print(f"\nChunks    : {len(chunks)} ({args.chunk_minutes:g} min checkpoints)")
+    print("Safety    : VAD on, previous-text conditioning off, progress saved after every chunk.")
+    print("First run may download the Whisper model into the local models folder.\n")
 
-    print(f"\nPrimary chunks: {len(chunks)} (~8 min each, 4 s overlap)")
-    print("Vocabulary: learned from transcript text; hidden SDK retries disabled; 4-minute fallback on stalls.")
-    print("Low-WPM QC: checked once on original chunks only (<35 WPM).")
-    print("A flagged original chunk is split once into ~4-minute halves.\n")
+    model, actual_device, actual_compute = load_model(args.model, args.device, args.compute_type)
 
     for chunk in chunks:
         idx = int(chunk["index"])
         key = str(idx)
         if key in state["chunks"]:
-            e = state["chunks"][key]
-            global_vocabulary = merge_vocab(
-                global_vocabulary,
-                e.get("chunk_vocabulary", []),
-                MAX_VOCAB_TERMS
-            )
+            entry = state["chunks"][key]
             print(
                 f"[{idx:02d}/{len(chunks):02d}] "
-                f"{fmt_time(chunk['start'])}–{fmt_time(chunk['end'])}: "
-                f"already saved ({e.get('status','OK')})"
+                f"{fmt_time(chunk['start'])} - {fmt_time(chunk['end'])}: "
+                f"already saved ({entry.get('status', 'OK')})"
             )
             continue
 
         print(
             f"[{idx:02d}/{len(chunks):02d}] "
-            f"{fmt_time(chunk['start'])}–{fmt_time(chunk['end'])}: transcribing..."
+            f"{fmt_time(chunk['start'])} - {fmt_time(chunk['end'])}: preparing audio..."
         )
-        entry, global_vocabulary = transcribe_primary_chunk(
-            client, source, global_vocabulary, work_dir, out_dir, chunk
+        audio_path = work_dir / f"chunk_{idx:03d}.wav"
+        extract_audio(source, chunk["start"], chunk["duration"], audio_path)
+
+        print("    Transcribing...")
+        started = time.monotonic()
+        segments, info = transcribe_chunk(
+            model,
+            audio_path,
+            chunk["start"],
+            language=args.language,
+            beam_size=args.beam_size,
+            prompt=args.prompt,
         )
+        elapsed = time.monotonic() - started
+        text = format_segment_text(segments)
+        metrics = qc_metrics(text, chunk["duration"], segments)
+        reasons = qc_reasons(metrics, chunk["duration"])
+        status = "OK" if not reasons else "NEEDS_REVIEW"
+
+        entry = {
+            "index": idx,
+            "backend": BACKEND,
+            "model": args.model,
+            "device": actual_device,
+            "compute_type": actual_compute,
+            "start": chunk["start"],
+            "end": chunk["end"],
+            "duration": chunk["duration"],
+            "elapsed_seconds": elapsed,
+            "speed_factor": chunk["duration"] / max(elapsed, 0.01),
+            "detected_language": info.get("language"),
+            "language_probability": info.get("language_probability"),
+            "text": text,
+            "segments": segments,
+            "metrics": metrics,
+            "reasons": reasons,
+            "status": status,
+        }
         state["chunks"][key] = entry
-        state["vocabulary"] = global_vocabulary
-        save_global_vocabulary(out_dir, global_vocabulary)
         save_state(state_path, state)
         write_outputs(out_dir, state)
 
-        m = entry["metrics"]
         print(
-            f"    Saved: {m['words']} words, {m['wpm']:.1f} WPM, "
-            f"repeat8={m['repeat8']}, {entry['status']}"
+            f"    Saved: {metrics['words']} words, {metrics['wpm']:.1f} WPM, "
+            f"{metrics['segments']} segments, {entry['speed_factor']:.1f}x realtime, {status}"
         )
+        if reasons:
+            print(f"    QC note: {', '.join(reasons)}")
 
     state["complete"] = len(state["chunks"]) == len(chunks)
+    state["completed_at"] = time.strftime("%Y-%m-%d %H:%M:%S") if state["complete"] else None
     save_state(state_path, state)
     write_outputs(out_dir, state)
 
-    if state["complete"]:
+    if state["complete"] and not args.keep_working:
         try:
             shutil.rmtree(work_dir)
         except Exception:
@@ -841,9 +660,8 @@ def main() -> int:
     print("=" * 68)
     print(f"Transcript : {out_dir / 'transcript.txt'}")
     print(f"QC report  : {out_dir / 'qc_report.txt'}")
-    print(f"Vocabulary : {out_dir / 'auto_vocabulary.txt'} (built progressively)")
-    print("\nIf a connection/API quota interruption happens, run the SAME lecture again.")
-    print("Completed chunks are skipped automatically.")
+    print(f"Segments   : {out_dir / 'segments.jsonl'}")
+    print("\nIf the terminal closes, run the same recording again. Completed chunks are skipped.")
     return 0
 
 
@@ -858,5 +676,5 @@ if __name__ == "__main__":
         print("TRANSCRIPTION STOPPED")
         print("=" * 68)
         print(str(exc))
-        print("\nSaved progress is kept. Rerun the same lecture to resume.")
+        print("\nSaved progress is kept. Rerun the same recording to resume.")
         raise SystemExit(1)

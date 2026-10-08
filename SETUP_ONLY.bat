@@ -33,6 +33,7 @@ if errorlevel 1 goto :failed
 
 echo.
 echo Setup complete.
+echo First transcription may still download the selected Whisper model.
 pause
 exit /b 0
 

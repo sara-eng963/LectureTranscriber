@@ -1,2 +1,2 @@
-google-genai>=2.29.0
 imageio-ffmpeg>=0.6.0
+faster-whisper>=1.2.0
